@@ -18,9 +18,9 @@ failure_derive = "0.1.5"
 lazy_static = "1.3"
 itertools = "0.8.0"
 resopt = { path = "lib/resopt/" }
-structopt = "0.2.15"
+structopt = "0.2.16"
 
-regex = "1.1.6"
+regex = "1.1.7"
 posticle = { path = "lib/posticle/" }
 
 slog = "2.4"
@@ -46,7 +46,7 @@ flaken = "0.2.2"
 chrono = "0.4"
 chrono-humanize = "0.0.11"
 
-openssl = "0.10.22"
+openssl = "0.10.23"
 pwhash = "0.3"
 
 base32 = "0.4"
