@@ -1,17 +1,19 @@
-use db::models::{NewAccount, NewUser, User};
-use db::validators;
-use db::{self, id_generator, DieselConnection, LOCAL_ACCOUNT_DOMAIN};
+use crate::crypto;
+use crate::db::models::{NewAccount, NewUser, User};
+use crate::db::validators;
+use crate::db::{self, id_generator, LOCAL_ACCOUNT_DOMAIN};
+use crate::routes::ui::templates::{SigninTemplate, SignupTemplate};
+use diesel::Connection;
 use failure::Error;
 use itertools::Itertools;
 use rocket::http::{Cookie, Cookies};
 use rocket::request::{FlashMessage, Form};
 use rocket::response::{Flash, Redirect};
-use routes::ui::templates::{SigninTemplate, SignupTemplate};
 use std::borrow::Cow;
 use validator::Validate;
 
 #[get("/auth/sign_in")]
-pub fn signin_get(flash: Option<FlashMessage>) -> SigninTemplate<'static> {
+pub fn signin_get<'b, 'c>(flash: Option<FlashMessage<'b, 'c>>) -> SigninTemplate<'static, 'b, 'c> {
     HtmlTemplate!(SigninTemplate, flash)
 }
 
@@ -27,11 +29,10 @@ pub fn signin_post(
     mut cookies: Cookies,
     db_conn: db::Connection,
 ) -> Result<Flash<Redirect>, Error> {
-    let form_data = form.get();
-    let user = User::by_username(&db_conn, &form_data.username)?;
+    let user = User::by_username(&db_conn, &form.username)?;
 
     if let Some(user) = user {
-        if user.valid_password(&form_data.password) {
+        if user.valid_password(&form.password) {
             cookies.add_private(Cookie::new("uid", user.id.to_string()));
 
             return Ok(Flash::success(Redirect::to("/"), "signed in!"));
@@ -78,7 +79,7 @@ pub struct SignupForm {
 }
 
 #[get("/auth/sign_up")]
-pub fn signup_get(flash: Option<FlashMessage>) -> SignupTemplate<'static> {
+pub fn signup_get<'b, 'c>(flash: Option<FlashMessage<'b, 'c>>) -> SignupTemplate<'static, 'b, 'c> {
     HtmlTemplate!(SignupTemplate, flash)
 }
 
@@ -87,8 +88,7 @@ pub fn signup_post(
     form: Form<SignupForm>,
     db_conn: db::Connection,
 ) -> Result<Flash<Redirect>, Error> {
-    let form_data = form.get();
-    if let Err(errs) = form_data.validate() {
+    if let Err(errs) = form.validate() {
         let errs = errs.field_errors();
 
         // concatenate the error descriptions, with commas between them.
@@ -99,12 +99,13 @@ pub fn signup_post(
             .map(|e| {
                 let msg = e.message.to_owned();
                 msg.unwrap_or(Cow::Borrowed("unknown error"))
-            }).join(", ");
+            })
+            .join(", ");
 
         return Ok(Flash::error(Redirect::to("/auth/sign_up"), error_desc));
     }
     if let Ok(Some(_)) =
-        db::models::Account::fetch_local_by_username(&db_conn, form_data.username.as_str())
+        db::models::Account::fetch_local_by_username(&db_conn, form.username.as_str())
     {
         return Ok(Flash::error(
             Redirect::to("/auth/sign_up"),
@@ -112,25 +113,33 @@ pub fn signup_post(
         ));
     }
 
+    let keypair = crypto::generate_keypair()?;
+
     (*db_conn).transaction::<_, _, _>(|| {
         let mut id_gen = id_generator();
+
         let account = NewAccount {
             id: id_gen.next(),
             domain: Some(LOCAL_ACCOUNT_DOMAIN.to_string()),
             uri: None,
 
-            username: form_data.username.to_owned(),
+            username: form.username.to_owned(),
 
             display_name: None,
             summary: None,
-        }.insert(&db_conn)?;
+
+            privkey: Some(keypair.private),
+            pubkey:  keypair.public,
+        }
+        .insert(&db_conn)?;
 
         NewUser {
             id: id_gen.next(),
-            email: form_data.email.to_owned(),
-            encrypted_password: User::encrypt_password(&form_data.password),
+            email: form.email.to_owned(),
+            encrypted_password: User::encrypt_password(&form.password),
             account_id: account.id,
-        }.insert(&db_conn)
+        }
+        .insert(&db_conn)
     })?;
 
     Ok(Flash::success(Redirect::to("/"), "signed up!"))

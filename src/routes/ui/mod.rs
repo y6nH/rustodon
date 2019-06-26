@@ -1,16 +1,17 @@
+use crate::db::models::{Account, NewStatus, Status, User};
+use crate::db::{self, id_generator};
+use crate::error::Perhaps;
+use crate::util::{Either, StatusID, Username};
 use chrono::offset::Utc;
-use db::models::{Account, NewStatus, Status, User};
-use db::{self, id_generator};
-use error::Perhaps;
 use failure::Error;
 use itertools::Itertools;
+use resopt::try_resopt;
 use rocket::http::RawStr;
 use rocket::request::{FlashMessage, Form, FromFormValue};
 use rocket::response::{Flash, NamedFile, Redirect};
 use rocket::Route;
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
-use util::Either;
 use validator::Validate;
 
 #[macro_use]
@@ -23,13 +24,14 @@ use self::templates::*;
 pub fn routes() -> Vec<Route> {
     routes![
         index,
-        index_paginated,
         user_page,
-        user_page_paginated,
+        user_page_simple,
         settings_profile,
         settings_profile_update,
         status_page,
+        status_page_simple,
         create_status,
+        delete_status,
         auth::signin_get,
         auth::signin_post,
         auth::signout,
@@ -37,11 +39,6 @@ pub fn routes() -> Vec<Route> {
         auth::signup_post,
         static_files
     ]
-}
-
-#[derive(FromForm, Debug)]
-pub struct UserPageParams {
-    max_id: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -62,12 +59,6 @@ impl<'v> FromFormValue<'v> for Timeline {
     }
 }
 
-#[derive(FromForm, Debug)]
-pub struct IndexPageParams {
-    max_id:   Option<i64>,
-    timeline: Option<Timeline>,
-}
-
 #[derive(Debug, FromForm, Validate)]
 pub struct CreateStatusForm {
     #[validate(length(min = "1", message = "Content must not be empty"))]
@@ -81,9 +72,7 @@ pub fn create_status(
     db_conn: db::Connection,
     form: Form<CreateStatusForm>,
 ) -> Result<Either<Flash<Redirect>, Redirect>, Error> {
-    let form_data = form.get();
-
-    if let Err(errs) = form_data.validate() {
+    if let Err(errs) = form.validate() {
         let errs = errs.field_errors();
 
         // concatenate the error descriptions, with commas between them.
@@ -94,14 +83,15 @@ pub fn create_status(
             .map(|e| {
                 let msg = e.message.to_owned();
                 msg.unwrap_or(Cow::Borrowed("unknown error"))
-            }).join(", ");
+            })
+            .join(", ");
 
         return Ok(Either::Left(Flash::error(Redirect::to("/"), error_desc)));
     }
 
     // convert CW to option if present, so we get proper nulls in DB
-    let content_warning: Option<String> = if form_data.content_warning.len() > 0 {
-        Some(form_data.content_warning.to_owned())
+    let content_warning: Option<String> = if !form.content_warning.is_empty() {
+        Some(form.content_warning.to_owned())
     } else {
         None
     };
@@ -109,57 +99,84 @@ pub fn create_status(
     let _status = NewStatus {
         id: id_generator().next(),
         created_at: Utc::now(),
-        text: form_data.content.to_owned(),
-        content_warning: content_warning,
+        text: form.content.to_owned(),
+        content_warning,
         account_id: user.account_id,
-    }.insert(&db_conn)?;
+    }
+    .insert(&db_conn)?;
 
     Ok(Either::Right(Redirect::to("/")))
 }
 
-#[get(
-    "/users/<username>/statuses/<status_id>",
-    format = "text/html"
-)]
-pub fn status_page(
+#[post("/users/<username>/statuses/<status_id>/delete")]
+pub fn delete_status(
     username: String,
-    status_id: u64,
+    status_id: StatusID,
+    user: User,
     db_conn: db::Connection,
-) -> Perhaps<StatusTemplate<'static>> {
+) -> Perhaps<Flash<Redirect>> {
+    let status_user = try_resopt!(User::by_username(&db_conn, username));
+
+    if status_user.id != user.id {
+        return Ok(Some(Flash::error(
+            Redirect::to("/"),
+            "not authorized to delete this status!",
+        )));
+    }
+
+    let status = try_resopt!(Status::by_account_and_id(
+        &db_conn,
+        status_user.account_id,
+        status_id.0 as i64
+    ));
+
+    use diesel::prelude::*;
+    diesel::delete(&status).execute(&*db_conn)?;
+
+    Ok(Some(Flash::success(Redirect::to("/"), "deleted status!")))
+}
+
+#[get("/users/<username>/statuses/<status_id>", format = "text/html")]
+pub fn status_page<'b, 'c>(
+    username: String,
+    status_id: StatusID,
+    user: Option<User>,
+    db_conn: db::Connection,
+) -> Perhaps<StatusTemplate<'static, 'b, 'c>> {
     let account = try_resopt!(Account::fetch_local_by_username(&db_conn, username));
     let status = try_resopt!(Status::by_account_and_id(
         &db_conn,
         account.id,
-        status_id as i64
+        status_id.0 as i64
     ));
 
     PerhapsHtmlTemplate!(StatusTemplate, {
         status:  status,
         account: account,
+        current_user: user,
         connection: db_conn
     })
 }
 
-// This is due to [SergioBenitez/Rocket#376](https://github.com/SergioBenitez/Rocket/issues/376).
-// If you don't like this, please complain over there.
-#[get("/users/<username>", format = "text/html")]
-pub fn user_page(
-    username: String,
-    db_conn: db::Connection,
-    account: Option<Account>,
-) -> Perhaps<UserTemplate<'static>> {
-    user_page_paginated(username, UserPageParams { max_id: None }, db_conn, account)
+#[get("/<username>/<status_id>", format = "text/html", rank = 2)]
+pub fn status_page_simple<'b, 'c>(
+    username: Username,
+    status_id: StatusID,
+    _user: Option<User>,
+    _db_conn: db::Connection,
+) -> Redirect {
+    Redirect::found(format!("/users/{}/statuses/{}", username.0, status_id.0))
 }
 
-#[get("/users/<username>?<params>", format = "text/html")]
-pub fn user_page_paginated(
+#[get("/users/<username>?<max_id>", format = "text/html")]
+pub fn user_page<'b, 'c>(
     username: String,
-    params: UserPageParams,
+    max_id: Option<i64>,
     db_conn: db::Connection,
     account: Option<Account>,
-) -> Perhaps<UserTemplate<'static>> {
+) -> Perhaps<UserTemplate<'static, 'b, 'c>> {
     let account_to_show = try_resopt!(Account::fetch_local_by_username(&db_conn, username));
-    let statuses: Vec<Status> = account_to_show.statuses_before_id(&db_conn, params.max_id, 10)?;
+    let statuses: Vec<Status> = account_to_show.statuses_before_id(&db_conn, max_id, 10)?;
     let prev_page_id = if let Some(prev_page_max_id) = statuses.iter().map(|s| s.id).min() {
         let bounds = account_to_show.status_id_bounds(&db_conn)?;
         // unwrap is safe since we already know we have statuses
@@ -180,11 +197,25 @@ pub fn user_page_paginated(
     })
 }
 
+#[get("/<username>?<max_id>", format = "text/html", rank = 2)]
+pub fn user_page_simple<'b, 'c>(
+    username: Username,
+    max_id: Option<i64>,
+    _db_conn: db::Connection,
+    _account: Option<Account>,
+) -> Redirect {
+    if let Some(max_id) = max_id {
+        Redirect::found(format!("/users/{}?max_id={}", username.0, max_id))
+    } else {
+        Redirect::found(format!("/users/{}", username.0))
+    }
+}
+
 #[get("/settings/profile")]
-pub fn settings_profile(
+pub fn settings_profile<'b, 'c>(
     db_conn: db::Connection,
     user: User,
-) -> Perhaps<EditProfileTemplate<'static>> {
+) -> Perhaps<EditProfileTemplate<'static, 'b, 'c>> {
     PerhapsHtmlTemplate!(EditProfileTemplate, {
         account: user.get_account(&db_conn)?
     })
@@ -201,50 +232,32 @@ pub fn settings_profile_update(
     user: User,
     form: Form<UpdateProfileForm>,
 ) -> Result<Redirect, Error> {
-    let form_data = form.get();
     let account = user.get_account(&db_conn)?;
 
-    // `as &str` defeat an incorrect deref coercion (due to the second match arm)
-    let new_summary = match &form_data.summary as &str {
+    let new_summary = match &form.summary[..] {
         "" => None,
         x => Some(x.to_string()),
     };
     account.set_summary(&db_conn, new_summary)?;
 
-    Ok(Redirect::to(&account.profile_path()))
+    Ok(Redirect::to(account.profile_path().to_string()))
 }
 
-#[get("/")]
-pub fn index(
-    flash: Option<FlashMessage>,
+#[get("/?<max_id>&<timeline>")]
+pub fn index<'b, 'c>(
+    flash: Option<FlashMessage<'b, 'c>>,
     account: Option<Account>,
+    max_id: Option<i64>,
+    timeline: Option<Timeline>,
     db_conn: db::Connection,
-) -> Result<IndexTemplate<'static>, Error> {
-    index_paginated(
-        flash,
-        account,
-        IndexPageParams {
-            max_id:   None,
-            timeline: None,
-        },
-        db_conn,
-    )
-}
-
-#[get("/?<params>")]
-pub fn index_paginated(
-    flash: Option<FlashMessage>,
-    account: Option<Account>,
-    params: IndexPageParams,
-    db_conn: db::Connection,
-) -> Result<IndexTemplate<'static>, Error> {
-    let statuses: Vec<Status> = match params.timeline {
-        Some(Timeline::Local) | None => Status::local_before_id(&db_conn, params.max_id, 10)?,
-        Some(Timeline::Federated) => Status::federated_before_id(&db_conn, params.max_id, 10)?,
+) -> Result<IndexTemplate<'static, 'b, 'c>, Error> {
+    let statuses: Vec<Status> = match timeline {
+        Some(Timeline::Local) | None => Status::local_before_id(&db_conn, max_id, 10)?,
+        Some(Timeline::Federated) => Status::federated_before_id(&db_conn, max_id, 10)?,
     };
 
     let prev_page_id = if let Some(prev_page_max_id) = statuses.iter().map(|s| s.id).min() {
-        let bounds = match params.timeline {
+        let bounds = match timeline {
             Some(Timeline::Local) | None => Status::local_status_id_bounds(&db_conn)?,
             Some(Timeline::Federated) => Status::federated_status_id_bounds(&db_conn)?,
         };
@@ -258,7 +271,8 @@ pub fn index_paginated(
         None
     };
 
-    let timeline_str = match params.timeline {
+    // todo: Into<String> and/or localization
+    let timeline_str = match timeline {
         Some(Timeline::Local) | None => "local",
         Some(Timeline::Federated) => "federated",
     };

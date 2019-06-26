@@ -1,7 +1,7 @@
 language: rust
 
 rust:
-  - nightly-2018-08-26
+  - nightly-2018-12-06
 
 addons:
   config:

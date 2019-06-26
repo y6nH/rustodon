@@ -1,12 +1,15 @@
-use db;
-use db::models::{Account, Status};
+use crate::crypto::HasPublicKey;
+use crate::db;
+use crate::db::models::{Account, Status};
+use crate::routes::ui::view_helpers::HasBio;
 use failure::Error;
 use rocket::http::{self, Accept, ContentType, MediaType};
 use rocket::request::{self, FromRequest, Request};
 use rocket::response::{self, Content, Responder};
-use routes::ui::view_helpers::HasBio;
 use serde::Serialize;
-use serde_json::{self, Value};
+use serde_json::{json, Value};
+use slog::slog_error;
+use slog_scope::error;
 
 /// Newtype for JSON which represents JSON-LD ActivityStreams2 objects.
 ///
@@ -23,9 +26,10 @@ where
                 let ap_json = ContentType::new("application", "activity+json");
 
                 Content(ap_json, string).respond_to(req).unwrap()
-            }).map_err(|e| {
-                // TODO: logging (what happens if the Value won't serialize?)
-                // the code i cribbed this from did some internal Rocket thing.
+            })
+            .map_err(|e| {
+                error!("Failed to serialize ActivityStreams2 content: {:?}", e);
+
                 http::Status::InternalServerError
             })
     }
@@ -69,13 +73,13 @@ fn is_as(accept: &Accept) -> bool {
 /// Trait implemented by structs which can serialize to
 /// ActivityPub-compliant ActivityStreams2 JSON-LD.
 pub trait AsActivityPub {
-    fn as_activitypub(&self, db: &db::Connection) -> Result<ActivityStreams, Error>;
+    fn as_activitypub(&self, db: &db::DbConnection) -> Result<ActivityStreams, Error>;
 }
 
 impl AsActivityPub for Account {
     fn as_activitypub(
         &self,
-        conn: &db::Connection,
+        conn: &db::DbConnection,
     ) -> Result<ActivityStreams<serde_json::Value>, Error> {
         Ok(ActivityStreams(json!({
             "@context": "https://www.w3.org/ns/activitystreams",
@@ -90,7 +94,13 @@ impl AsActivityPub for Account {
 
             "preferredUsername": self.username,
             "name": self.display_name.as_ref().map(String::as_str).unwrap_or(""),
-            "summary": self.transformed_bio(&conn).unwrap_or("<p></p>".to_string()),
+            "summary": self.transformed_bio(&conn).as_ref().map(String::as_str).unwrap_or("<p></p>"),
+
+            "publicKey": {
+                "id": format!("{}#main-key", self.get_uri()),
+                "owner": self.get_uri(),
+                "publicKeyPem": self.public_key_pem()?,
+            }
         })))
     }
 }
@@ -98,7 +108,7 @@ impl AsActivityPub for Account {
 impl AsActivityPub for Status {
     fn as_activitypub(
         &self,
-        conn: &db::Connection,
+        conn: &db::DbConnection,
     ) -> Result<ActivityStreams<serde_json::Value>, Error> {
         let account = self.account(conn)?;
         Ok(ActivityStreams(json!({
@@ -129,7 +139,8 @@ mod tests {
         let accept_json = Accept::from_str("application/activity+json").unwrap();
         let accept_json_ld = Accept::from_str(
             "application/ld+json; profile=\"https://www.w3.org/ns/activitystreams\"",
-        ).unwrap();
+        )
+        .unwrap();
 
         assert!(is_as(&accept_json_ld));
         assert!(is_as(&accept_json));
